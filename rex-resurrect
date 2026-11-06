@@ -1,0 +1,982 @@
+#!/usr/bin/env python3
+"""rex resurrect: save the Claude Code, Codex and Pi conversations open in Rex
+panes, and resume each one in its own pane after Rex or the Mac restarts.
+
+  rex resurrect save           record every agent pane (run before quitting Rex)
+  rex resurrect                resume every recorded agent and check each one
+  rex resurrect --dry-run      show what a restore would do, change nothing
+  rex resurrect --again        restore the last save again
+  rex resurrect --from FILE    restore an older save from the history folder
+  rex resurrect show           print the saved panes and their commands
+  rex resurrect save --force   save even though the last save was never restored
+
+How a restore works. Rex brings back sessions, tabs, splits and folders with
+the same pane IDs, as fresh shells. For each saved pane, rex resurrect waits
+for the shell prompt, types the resume command, and then checks that the agent
+is running the saved conversation. A pane Rex lost is rebuilt: as a split in
+its tab if the tab survived, else as a new tab with the saved label in its
+session, else in a new session with the saved name. A conversation that is
+already open anywhere, in any pane or any Claude or Pi process, is never
+opened a second time, so running it twice is safe. A pane busy with something
+else is left alone and reported. rex resurrect never starts or stops a Rex
+server.
+
+A save is used once. After a restore in which every pane came back, it moves
+to snapshot.restored.json, so an old save never reopens panes closed since.
+If any pane failed, the save stays, and running rex resurrect again retries
+only the panes that are not back. Every save is also kept in the history
+folder (the last 50).
+
+If Rex restarted after the current save and no restore has run since, a new
+save goes to the history folder only, so the save you need isn't replaced.
+Pass --force to make the new save the current one.
+
+How each conversation is found, most exact first:
+  Claude Code  <CLAUDE_CONFIG_DIR or ~/.claude>/sessions/<pid>.json, which
+               Claude keeps current through /clear and /resume
+  Codex        the open rollout file whose conversation name matches the pane
+               title Codex sets, else the most recently written open rollout
+  Pi           ~/.local/state/rex-resurrect/pi/<pid>.json, written by the
+               rex-resurrect Pi extension at every session start
+When the exact source is missing, the conversation is worked out by
+elimination and the save marks it "guessed".
+"""
+
+import ctypes
+import fcntl
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from collections import defaultdict, deque
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("REX_RESURRECT_STATE") or Path.home() / ".local/state/rex-resurrect")
+SNAPSHOT = STATE_DIR / "snapshot.json"
+RESTORED = STATE_DIR / "snapshot.restored.json"
+HISTORY = STATE_DIR / "history"
+HISTORY_KEEP = 50
+PI_STATE = Path.home() / ".local/state/rex-resurrect/pi"  # written by the Pi extension
+
+AGENTS = ("claude", "codex", "pi")
+INTERPRETERS = {"node", "bun", "deno", "nodejs"}
+SHELLS = {"zsh", "bash", "fish", "sh", "dash", "ksh", "tcsh", "nu", "elvish", "xonsh"}
+TERMINAL = "com.superlogical.terminal"
+
+# Environment worth repeating on resume: where each agent keeps its
+# conversations, and which model endpoint it talks to. Never keys or tokens.
+REPLAY_ENV = {
+    "claude": re.compile(r"CLAUDE_CONFIG_DIR|ANTHROPIC_BASE_URL|ANTHROPIC_MODEL|ANTHROPIC_SMALL_FAST_MODEL"
+                         r"|ANTHROPIC_DEFAULT_[A-Z]+_MODEL|CLAUDE_CODE_USE_[A-Z]+"),
+    "codex": re.compile(r"CODEX_HOME|OPENAI_BASE_URL"),
+    "pi": re.compile(r"PI_CODING_AGENT_DIR|PI_CODING_AGENT_SESSION_DIR"),
+}
+
+# Flags that choose or start a conversation, or only make sense once. The
+# resume command picks the conversation itself, so these are never repeated.
+DROP_FLAGS = {
+    "claude": {"-c", "--continue", "-r", "--resume", "--session-id", "--fork-session", "--from-pr",
+               "--teleport", "-p", "--print", "-w", "--worktree", "--cloud"},
+    "codex": {"-i", "--image", "-C", "--cd", "--last", "--all", "--worktree"},
+    "pi": {"-c", "--continue", "-r", "--resume", "--session", "--session-id", "--fork",
+           "--no-session", "-p", "--print", "--export", "--api-key"},
+}
+
+# Flags known to take a value, used together with what each agent's --help
+# says. The help text is read at save time, so new flags are handled too.
+KNOWN_VALUE_FLAGS = {
+    "claude": {"--add-dir", "--agent", "--agents", "--allowedTools", "--allowed-tools",
+               "--append-system-prompt", "--betas", "--debug-file", "--disallowedTools",
+               "--disallowed-tools", "--effort", "--fallback-model", "--mcp-config", "--model", "-n",
+               "--name", "--permission-mode", "--plugin-dir", "--session-id", "--setting-sources",
+               "--settings", "--system-prompt", "--tools"},
+    "codex": {"-c", "--config", "--enable", "--disable", "-i", "--image", "-m", "--model", "-p",
+              "--profile", "-s", "--sandbox", "-C", "--cd", "--add-dir", "-a", "--ask-for-approval"},
+    "pi": {"--provider", "--model", "--api-key", "--system-prompt", "--append-system-prompt", "--mode",
+           "--session", "--session-id", "--fork", "--session-dir", "-n", "--name", "--models", "-t",
+           "--tools", "-xt", "--exclude-tools", "--thinking", "-e", "--extension", "--skill",
+           "--prompt-template", "--theme", "--use-theme", "--tui-mode", "--export"},
+}
+KNOWN_OPTIONAL_VALUE_FLAGS = {"claude": {"-r", "--resume", "--from-pr", "--teleport", "-w", "--worktree",
+                                         "--cloud", "-d", "--debug"}}
+HELP_LINE = re.compile(r"^\s{1,10}(-{1,2}[A-Za-z][\w-]*(?:,\s*-{1,2}[A-Za-z][\w-]*)*)(?:[ =](<[^>]*>|\[[^\]]*\]))?")
+
+
+class RexError(Exception):
+    pass
+
+
+# ---------- Rex ----------
+
+def rex(*args):
+    # Never start a server: rex resurrect only talks to the one already running.
+    try:
+        out = subprocess.run(["rex", "--autostart=false", *args], capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise RexError(f"rex {' '.join(args)} timed out")
+    except FileNotFoundError:
+        raise RexError("rex is not on PATH")
+    if out.returncode != 0:
+        raise RexError(f"rex {' '.join(args)}: {(out.stderr or out.stdout).strip()}")
+    return out.stdout
+
+
+def rex_json(*args):
+    return json.loads(rex(*args, "--json"))
+
+
+def block_call(sid, bid, method):
+    return json.loads(rex("block", "call", "-s", sid, "-b", bid, method))
+
+
+def server_status():
+    return json.loads(rex("api", "call", "server.status", "{}"))
+
+
+def live_layout():
+    """Every session, and where each live block and window sits."""
+    sessions = rex_json("ls")["sessions"]
+    blocks, windows = {}, defaultdict(list)
+    for s in sessions:
+        for b in rex_json("block", "ls", "-s", s["session_id"])["blocks"]:
+            blocks[b["block_id"]] = {"session_id": s["session_id"], "window_id": b.get("window_id"),
+                                     "creator": b.get("creator_name"), "host_id": b.get("host_id")}
+            if b.get("window_id") and b.get("placement") == "placed":
+                windows[b["window_id"]].append(b["block_id"])
+    return sessions, blocks, windows
+
+
+# ---------- processes ----------
+
+def process_children():
+    out = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True, text=True).stdout
+    children = defaultdict(list)
+    for line in out.splitlines():
+        pid, ppid = (int(x) for x in line.split())
+        children[ppid].append(pid)
+    return children
+
+
+def proc_args_env(pid):
+    """Executable, exact argv and environment of a process, or None if unreadable."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+    size = ctypes.c_size_t(0)
+    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or not size.value:
+        return None
+    buf = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+        return None
+    raw = buf.raw[: size.value]
+    argc = int.from_bytes(raw[:4], sys.byteorder)
+    exe, _, rest = raw[4:].partition(b"\0")
+    words = rest.lstrip(b"\0").split(b"\0")
+    argv = [w.decode(errors="replace") for w in words[:argc]]
+    env = {}
+    for w in words[argc:]:
+        if not w:
+            break
+        key, sep, value = w.decode(errors="replace").partition("=")
+        if sep:
+            env[key] = value
+    return exe.decode(errors="replace"), argv, env
+
+
+def proc_start(pid):
+    out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                         env={**os.environ, "LC_ALL": "C"}).stdout.strip()
+    return datetime.strptime(out, "%a %b %d %H:%M:%S %Y").timestamp() if out else 0.0
+
+
+def proc_cwd(pid):
+    out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], capture_output=True, text=True).stdout
+    return next((line[1:] for line in out.splitlines() if line.startswith("n")), None)
+
+
+def open_files(pid):
+    out = subprocess.run(["lsof", "-a", "-p", str(pid), "-Fn"], capture_output=True, text=True).stdout
+    return {line[1:] for line in out.splitlines() if line.startswith("n/")}
+
+
+def agent_of(argv):
+    """The agent an argv runs, and the index of its first own argument."""
+    for i, word in enumerate(argv[:4]):
+        stem = re.sub(r"\.(m?js|cjs|ts)$", "", os.path.basename(word))
+        if stem in AGENTS:
+            return stem, i + 1
+        if "/claude/versions/" in word or "@anthropic-ai/claude-code/" in word:
+            return "claude", i + 1
+        if "@openai/codex/" in word:
+            return "codex", i + 1
+        if "/pi-coding-agent/" in word:
+            return "pi", i + 1
+        if i == 0 and stem not in INTERPRETERS:
+            return None, 0
+        if i > 0 and not word.startswith("-"):
+            return None, 0  # a script that is not an agent
+    return None, 0
+
+
+def is_agent_process(pid, agent, recorded_at):
+    """Whether pid is still the agent that wrote a record at recorded_at. After
+    a reboot, a record's pid can belong to an unrelated process."""
+    info = proc_args_env(pid)
+    if not info or agent_of(info[1])[0] != agent:
+        return False
+    return proc_start(pid) <= recorded_at + 5
+
+
+def pane_agents(root_pid, foreground_pid, children):
+    """Agent processes in a pane's process tree, shallowest first.
+
+    Only agents hosted by an interpreter are searched below, because they may
+    be wrappers around the real agent. A native agent's children are its own
+    tools, and an agent it starts is not the pane's conversation."""
+    found, queue, seen = [], deque([(root_pid, 0)]), set()
+    while queue:
+        pid, depth = queue.popleft()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        info = proc_args_env(pid)
+        agent, start = agent_of(info[1]) if info else (None, 0)
+        if agent:
+            found.append({"pid": pid, "depth": depth, "agent": agent, "start": start,
+                          "exe": info[0], "argv": info[1], "env": info[2]})
+            if os.path.basename(info[1][0]) not in INTERPRETERS:
+                continue
+        queue.extend((child, depth + 1) for child in sorted(children.get(pid, [])))
+    found.sort(key=lambda a: (a["depth"], a["pid"] != foreground_pid))
+    return found
+
+
+# ---------- conversations ----------
+
+class Unknown(Exception):
+    """The agent is running but its conversation can't be identified."""
+
+
+def by_elimination(candidates, claimed, since):
+    """The one conversation file started or written since `since` that no
+    other running agent holds, else Unknown."""
+    left = [c for c in candidates if c.stat().st_mtime >= since - 2 and str(c) not in claimed]
+    if len(left) == 1:
+        return left[0]
+    raise Unknown(f"{len(left)} possible conversations, can't tell which" if left
+                  else "no conversation file found")
+
+
+def claude_home(env):
+    return Path(env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
+def claude_conversation(a, cwd, ctx):
+    home = claude_home(a["env"])
+    registry = home / "sessions" / f"{a['pid']}.json"
+    if registry.exists():
+        record = json.loads(registry.read_text())
+        if record.get("pid") == a["pid"] and record.get("startedAt", 0) / 1000 >= ctx.start(a["pid"]) - 5:
+            sid = record["sessionId"]
+            if not any((home / "projects").glob(f"*/{sid}.jsonl")):
+                return None  # no messages yet, so there is nothing to resume
+            return {"id": sid, "name": record.get("name"), "source": "Claude session registry"}
+    project = home / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd or "")
+    claimed = ctx.claude_claimed(home)
+    found = by_elimination(project.glob("*.jsonl"), claimed, ctx.start(a["pid"]))
+    return {"id": found.stem, "source": "guessed by elimination", "guessed": True}
+
+
+def codex_home(env):
+    return Path(env.get("CODEX_HOME") or Path.home() / ".codex")
+
+
+def codex_names(home, cache={}):
+    if home not in cache:
+        names, index = {}, home / "session_index.jsonl"
+        if index.exists():
+            for line in index.read_text(errors="replace").splitlines():
+                try:
+                    entry = json.loads(line)
+                    names[entry["id"]] = entry.get("thread_name")
+                except (ValueError, KeyError):
+                    continue
+        cache[home] = names
+    return cache[home]
+
+
+def codex_conversation(a, title, ctx):
+    mains = []
+    for path in open_files(a["pid"]):
+        name = os.path.basename(path)
+        if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+            continue
+        try:
+            with open(path) as f:
+                meta = json.loads(f.readline()).get("payload", {})
+        except (OSError, ValueError):
+            continue
+        if meta.get("id") and not isinstance(meta.get("source"), dict):  # subagents have a dict source
+            mains.append((os.path.getmtime(path), meta["id"]))
+    if not mains:
+        return None  # no messages yet, so there is nothing to resume
+    names = codex_names(codex_home(a["env"]))
+    if title:
+        matches = [cid for _, cid in mains
+                   if names.get(cid) and (title == names[cid] or title.startswith(names[cid] + " | "))]
+        if len(matches) == 1:
+            return {"id": matches[0], "name": names.get(matches[0]), "source": "Codex pane title"}
+    mains.sort(reverse=True)
+    cid = mains[0][1]
+    if len(mains) == 1:
+        return {"id": cid, "name": names.get(cid), "source": "Codex open rollout"}
+    return {"id": cid, "name": names.get(cid), "source": f"newest of {len(mains)} open rollouts",
+            "guessed": True}
+
+
+def pi_conversation(a, cwd, ctx):
+    record_file = PI_STATE / f"{a['pid']}.json"
+    if record_file.exists() and record_file.stat().st_mtime >= ctx.start(a["pid"]) - 2:
+        record = json.loads(record_file.read_text())
+        if record.get("pid") == a["pid"]:
+            session = record.get("sessionFile")
+            if not session or not Path(session).exists():
+                return None  # no messages yet, so there is nothing to resume
+            return {"id": session, "source": "Pi extension"}
+    env = a["env"]
+    root = Path(env.get("PI_CODING_AGENT_SESSION_DIR")
+                or Path(env.get("PI_CODING_AGENT_DIR") or Path.home() / ".pi/agent") / "sessions")
+    folder = root / ("--" + (cwd or "").strip("/").replace("/", "-") + "--")
+    found = by_elimination(folder.glob("*.jsonl"), ctx.pi_claimed(), ctx.start(a["pid"]))
+    return {"id": str(found), "source": "guessed by elimination", "guessed": True}
+
+
+class Context:
+    """Caches shared across the panes of one save or restore."""
+
+    def __init__(self):
+        self.children = process_children()
+        self._starts, self._claude, self._pi, self._help = {}, {}, None, {}
+
+    def start(self, pid):
+        if pid not in self._starts:
+            self._starts[pid] = proc_start(pid)
+        return self._starts[pid]
+
+    def claude_claimed(self, home):
+        if home not in self._claude:
+            claimed = set()
+            for registry in (home / "sessions").glob("*.json"):
+                try:
+                    record = json.loads(registry.read_text())
+                    if not is_agent_process(record["pid"], "claude", record["startedAt"] / 1000):
+                        continue
+                    claimed.update(str(p) for p in (home / "projects").glob(f"*/{record['sessionId']}.jsonl"))
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
+            self._claude[home] = claimed
+        return self._claude[home]
+
+    def pi_claimed(self):
+        if self._pi is None:
+            self._pi = set()
+            for record_file in PI_STATE.glob("*.json"):
+                try:
+                    record = json.loads(record_file.read_text())
+                    if not is_agent_process(record["pid"], "pi", record_file.stat().st_mtime):
+                        continue
+                    self._pi.add(record["sessionFile"])
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
+        return self._pi
+
+    def flag_spec(self, a):
+        """(value flags, optional-value flags, variadic flags) for an agent."""
+        key = (a["agent"], a["exe"])
+        if key not in self._help:
+            agent = a["agent"]
+            required = set(KNOWN_VALUE_FLAGS[agent])
+            optional = set(KNOWN_OPTIONAL_VALUE_FLAGS.get(agent, ()))
+            variadic = set()
+            prefix = [a["exe"], *a["argv"][1:a["start"]]]
+            for extra in ([], ["resume"]) if agent == "codex" else ([],):
+                try:
+                    text = subprocess.run([*prefix, *extra, "--help"], capture_output=True, text=True,
+                                          timeout=20, stdin=subprocess.DEVNULL).stdout
+                except (OSError, subprocess.TimeoutExpired):
+                    continue
+                for line in text.splitlines():
+                    m = HELP_LINE.match(line)
+                    if not m or not m.group(2):
+                        continue
+                    names = re.findall(r"-{1,2}[A-Za-z][\w-]*", m.group(1))
+                    (required if m.group(2).startswith("<") else optional).update(names)
+                    if "..." in m.group(2):
+                        variadic.update(names)
+            self._help[key] = (required - optional, optional, variadic)
+        return self._help[key]
+
+
+def replay_flags(agent, args, spec):
+    """The launch flags worth repeating on resume, without prompts or files."""
+    required, optional, variadic = spec
+    if agent == "codex" and args[:1] and args[0] in ("resume", "fork"):
+        args = args[1:]
+        if args and not args[0].startswith("-"):
+            args = args[1:]  # the conversation it was started with
+    kept, i = [], 0
+    while i < len(args):
+        word = args[i]
+        if word == "--":
+            break  # everything after is a prompt or file
+        if not word.startswith("-") or word == "-":
+            i += 1  # a prompt or file given at launch
+            continue
+        flag = word.split("=", 1)[0]
+        n = 1
+        if "=" not in word:
+            if flag in variadic:
+                while i + n < len(args) and not args[i + n].startswith("-"):
+                    n += 1
+            elif flag in required and i + 1 < len(args):
+                n = 2
+            elif flag in optional and i + 1 < len(args) and not args[i + 1].startswith("-"):
+                n = 2
+        if flag not in DROP_FLAGS[agent]:
+            kept.extend(args[i:i + n])
+        i += n
+    return kept
+
+
+def resume_command(agent, conv, flags, env):
+    exports = [f"{k}={shlex.quote(v)}" for k, v in sorted(env.items())]
+    if conv is None:
+        cmd = [agent, *flags]
+    elif agent == "claude":
+        cmd = ["claude", "--resume", conv["id"], *flags]
+    elif agent == "codex":
+        cmd = ["codex", "resume", conv["id"], *flags]
+    else:
+        cmd = ["pi", "--session", conv["id"], *flags]
+    return " ".join([*exports, shlex.join(cmd)])
+
+
+def program_name(p):
+    return os.path.basename((p or {}).get("argv0") or (p or {}).get("name") or "").lstrip("-")
+
+
+def at_prompt(proc):
+    """Whether the pane's own shell is in the foreground, waiting at its prompt.
+    A shell running a script (bash ./script.sh) has a shell above it, so it
+    doesn't count."""
+    fg = proc.get("foreground") or {}
+    return (program_name(fg) in SHELLS
+            and not any(program_name(a) in SHELLS for a in proc.get("ancestors") or []))
+
+
+def inspect_pane(sid, bid, ctx):
+    """What a pane is running: an agent with its conversation, a shell at its
+    prompt, or another program."""
+    proc = block_call(sid, bid, "process")
+    root = (proc.get("child") or {}).get("pid")
+    fg = proc.get("foreground") or {}
+    if not root:
+        return {"kind": "not started", "program": "nothing yet"}
+    found = pane_agents(root, fg.get("pid"), ctx.children)
+    if not found:
+        return {"kind": "shell" if at_prompt(proc) else "program", "program": program_name(fg) or "a program"}
+    # Below the outermost agent, only the same agent can be its real process
+    # (a wrapper chain). Another agent there is one of its tools.
+    found = [a for a in found if a["agent"] == found[0]["agent"]]
+
+    def conversation(a):
+        cwd = proc_cwd(a["pid"]) or fg.get("cwd")
+        if a["agent"] == "claude":
+            return claude_conversation(a, cwd, ctx), cwd
+        if a["agent"] == "codex":
+            title = block_call(sid, bid, "title")
+            own = title.get("title") if (title.get("owner") or {}).get("pid") == a["pid"] else None
+            return codex_conversation(a, own, ctx), cwd
+        return pi_conversation(a, cwd, ctx), cwd
+
+    # A wrapper and the agent it runs both match; the one that holds the
+    # conversation wins, else the outermost.
+    results = []
+    for a in found:
+        try:
+            conv, cwd = conversation(a)
+        except Unknown as e:
+            conv, cwd, problem = None, proc_cwd(a["pid"]), str(e)
+        else:
+            problem = None
+        results.append((a, conv, cwd, problem))
+        if conv is not None:
+            break
+    a, conv, cwd, problem = next((r for r in results if r[1] is not None), results[0])
+    return {"kind": "agent", "agent": a, "conversation": conv, "cwd": cwd, "problem": problem}
+
+
+# ---------- save ----------
+
+def parse_time(text):
+    when = datetime.fromisoformat(text)
+    return when if when.tzinfo else when.astimezone()
+
+
+def local(text):
+    return parse_time(text).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, path)
+
+
+def latest_history():
+    files = sorted(HISTORY.glob("*.json"))
+    try:
+        return json.loads(files[-1].read_text()) if files else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def unrestored_after_restart(status):
+    """The current save, if Rex restarted after it and no restore has run."""
+    if not SNAPSHOT.exists():
+        return None
+    previous = json.loads(SNAPSHOT.read_text())
+    if previous.get("restored_at"):
+        return None
+    restarted = parse_time(status["started_at"]) > parse_time(previous["saved_at"])
+    return previous if restarted else None
+
+
+def save(force):
+    status = server_status()
+    blocked_by = None if force else unrestored_after_restart(status)
+    previous_panes = {p["block_id"]: p for p in latest_history().get("panes", [])}
+
+    ctx = Context()
+    host_id = status.get("host_id")
+    panes, problems, others = [], [], []
+    for session in rex_json("ls")["sessions"]:
+        sid, slabel = session["session_id"], session.get("label")
+        try:
+            windows = rex_json("session", "inspect", sid)["windows"]
+            blocks = rex_json("block", "ls", "-s", sid)["blocks"]
+        except (RexError, ValueError, KeyError) as e:
+            problems.append(f"{slabel}: couldn't read the session: {e}")
+            continue
+        window_info = {w["window_id"]: (i, w.get("label")) for i, w in enumerate(windows)}
+        for block in blocks:
+            if block.get("creator_name") != TERMINAL:
+                continue
+            bid = block["block_id"]
+            index, wlabel = window_info.get(block.get("window_id"), (None, None))
+            where = f"{slabel} / {wlabel or block.get('label') or bid[-8:]}"
+            if host_id and block.get("host_id") and block["host_id"] != host_id:
+                problems.append(f"{where}: runs on another host, which rex resurrect can't inspect")
+                continue
+            found = error = None
+            for attempt in range(2):  # a pane can be briefly unreadable, e.g. mid-write
+                try:
+                    found = inspect_pane(sid, bid, ctx)
+                    break
+                except (RexError, OSError, ValueError, KeyError, IndexError, TypeError) as e:
+                    error = e
+                    time.sleep(0.5)
+            if found is None:
+                kept = previous_panes.get(bid)
+                if kept:
+                    panes.append({**kept, "problem": f"couldn't inspect the pane ({error}); "
+                                                     "kept its entry from the previous save"})
+                    problems.append(f"{where}: couldn't inspect the pane ({error}); "
+                                    "kept its entry from the previous save")
+                else:
+                    problems.append(f"{where}: couldn't inspect the pane, so it isn't saved: {error}")
+                continue
+            if found["kind"] != "agent":
+                if found["kind"] == "program":
+                    others.append(f"{where}: {found['program']}")
+                continue
+            a, conv = found["agent"], found["conversation"]
+            env = {k: v for k, v in a["env"].items() if REPLAY_ENV[a["agent"]].fullmatch(k)}
+            flags = replay_flags(a["agent"], a["argv"][a["start"]:], ctx.flag_spec(a))
+            pane = {
+                "session_id": sid, "session_label": slabel,
+                "window_id": block.get("window_id"), "window_index": index, "window_label": wlabel,
+                "block_id": bid, "block_label": block.get("label"), "placement": block.get("placement"),
+                "cwd": found["cwd"], "agent": a["agent"], "pid": a["pid"],
+                "env": env, "conversation": conv, "problem": found["problem"],
+                "command": resume_command(a["agent"], conv, flags, env),
+            }
+            panes.append(pane)
+            if found["problem"]:
+                problems.append(f"{where} ({a['agent']}): {found['problem']}; "
+                                "it will come back as a new conversation")
+
+    data = {"saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "server_started_at": status.get("started_at"), "panes": panes,
+            "problems": problems, "other_programs": others}
+    stamp = data["saved_at"].replace(":", "")
+    history_file = HISTORY / f"{stamp}.json"
+    write_json(history_file, data)
+    for old in sorted(HISTORY.glob("*.json"))[:-HISTORY_KEEP]:
+        old.unlink()
+    if blocked_by:
+        print(f"Rex restarted after your save from {local(blocked_by['saved_at'])}, and that save "
+              "hasn't been restored yet, so it was kept as the one `rex resurrect` uses.")
+        print(f"This save ({len(panes)} agent panes) went to history only:")
+        print(f"  {history_file}")
+        print("  Run `rex resurrect` first, or `rex resurrect save --force` to make this save the current one.")
+        return 1
+    write_json(SNAPSHOT, data)
+    for record_file in PI_STATE.glob("*.json"):  # Pi processes that have exited
+        try:
+            os.kill(int(record_file.stem), 0)
+        except (ProcessLookupError, ValueError):
+            record_file.unlink(missing_ok=True)
+        except PermissionError:
+            pass
+
+    guessed = sum(1 for p in panes if (p["conversation"] or {}).get("guessed"))
+    fresh = sum(1 for p in panes if p["conversation"] is None and not p["problem"])
+    print(f"Saved {len(panes)} agent panes.")
+    print_panes(panes)
+    if guessed:
+        print(f"\n{guessed} conversation(s) marked guessed: the exact source was missing, "
+              "so it was worked out by elimination.")
+    if fresh:
+        print(f"{fresh} agent(s) had no messages yet and will come back as new conversations.")
+    if others:
+        print("\nAlso open, not agents (left as they are):")
+        for line in others:
+            print(f"  {line}")
+    if problems:
+        print("\nNeeds attention:")
+        for line in problems:
+            print(f"  {line}")
+    return 1 if problems else 0
+
+
+def describe(p):
+    conv = p["conversation"]
+    if conv is None:
+        return "new conversation"
+    text = conv.get("name") or conv["id"]
+    return f"{text}  (guessed)" if conv.get("guessed") else text
+
+
+def print_panes(panes):
+    for p in panes:
+        where = f"{p['session_label']} / {p['window_label']}"
+        print(f"  {where:<44} {p['agent']:<6} {describe(p)}")
+
+
+def show():
+    path = SNAPSHOT if SNAPSHOT.exists() else RESTORED
+    if not path.exists():
+        print("Nothing saved yet. Run `rex resurrect save` before quitting Rex.")
+        return 1
+    data = json.loads(path.read_text())
+    used = " (already restored)" if path == RESTORED else ""
+    print(f"Saved {local(data['saved_at'])}{used}: {len(data['panes'])} agent panes")
+    for p in data["panes"]:
+        print(f"  {p['session_label']} / {p['window_label']}  [{p['block_id'][-8:]}]  {describe(p)}")
+        print(f"    {p['command']}")
+    for line in data.get("problems", []):
+        print(f"  needs attention: {line}")
+    return 0
+
+
+# ---------- restore ----------
+
+def wait_for_prompt(sid, bid, timeout=30):
+    """Wait until a pane's shell has drawn its prompt. Returns what the pane is
+    running then: 'shell', or the name of another program."""
+    deadline, shell_since = time.time() + timeout, None
+    while True:
+        proc = block_call(sid, bid, "process")
+        fg = proc.get("foreground") or {}
+        name = program_name(fg)
+        if at_prompt(proc):
+            shell_since = shell_since or time.time()
+            owner = (block_call(sid, bid, "pwd").get("owner") or {}).get("pid")
+            # The shell reports its folder each time it draws a prompt; a shell
+            # without that integration gets two seconds to draw one.
+            if owner == fg.get("pid") or time.time() - shell_since > 2:
+                time.sleep(0.2)
+                return "shell"
+        elif name and name != "login":
+            return name
+        if time.time() > deadline:
+            return name or "not started"
+        time.sleep(0.25)
+
+
+def is_back(p, found):
+    if found.get("kind") != "agent" or found["agent"]["agent"] != p["agent"]:
+        return False
+    want, have = p["conversation"], found["conversation"]
+    return want is None or (have is not None and have["id"] == want["id"])
+
+
+class Rebuilder:
+    """Recreates panes Rex lost, keeping saved tabs and sessions together."""
+
+    def __init__(self, sessions, blocks, windows):
+        self.sessions, self.blocks, self.windows = sessions, blocks, windows
+        self.session_map, self.window_map = {}, {}
+
+    def session_for(self, p):
+        if p["session_id"] in self.session_map:
+            return self.session_map[p["session_id"]]
+        for s in self.sessions:
+            if s["session_id"] == p["session_id"]:
+                return s["session_id"]
+        for s in self.sessions:
+            if s.get("label") and s.get("label") == p["session_label"]:
+                return s["session_id"]
+        return None
+
+    def plan(self, p):
+        if p.get("window_id") in self.windows or p.get("window_id") in self.window_map:
+            return "as a split in its tab"
+        return "as a new tab" if self.session_for(p) else "in a new session"
+
+    def create(self, p):
+        cwd = p.get("cwd") if p.get("cwd") and os.path.isdir(p["cwd"]) else str(Path.home())
+        label = p.get("window_label") or p["agent"]
+        wid = p.get("window_id")
+        if wid in self.window_map or wid in self.windows:
+            sid, beside = self.window_map.get(wid) or (self.blocks[self.windows[wid][-1]]["session_id"],
+                                                       self.windows[wid][-1])
+            out = rex_json("split", "-s", sid, "-b", beside, "--split=right", "--focus=false", "-c", cwd)
+            bid, new_wid = out["block_ids"][0], wid
+        elif self.session_for(p):
+            sid = self.session_for(p)
+            out = rex_json("window", "new", "-s", sid, label, "-c", cwd, "--focus=false")
+            bid, new_wid = out["block_ids"][0], out.get("window_id")
+        else:
+            out = rex_json("new", p.get("session_label") or "Restored", "--window", label, "-c", cwd)
+            sid = out["session_id"]
+            bid, new_wid = out["initial_windows"][0]["block_ids"][0], out["initial_windows"][0].get("window_id")
+            self.sessions.append({"session_id": sid, "label": p.get("session_label")})
+        self.session_map[p["session_id"]] = sid
+        if wid:
+            self.window_map[wid] = (sid, bid)
+        return sid, bid, new_wid
+
+
+def open_conversations(sessions, blocks, ctx):
+    """Every conversation open right now, and where: in any Rex pane, or in
+    any running Claude or Pi process. Also what each live pane is running."""
+    labels = {s["session_id"]: s.get("label") for s in sessions}
+    where, by_block = {}, {}
+    for bid, b in blocks.items():
+        if b["creator"] != TERMINAL:
+            continue
+        try:
+            found = inspect_pane(b["session_id"], bid, ctx)
+        except (RexError, OSError, ValueError, KeyError, IndexError, TypeError):
+            continue
+        by_block[bid] = found
+        if found["kind"] == "agent" and found["conversation"]:
+            where[found["conversation"]["id"]] = f"{labels.get(b['session_id'])} [{bid[-8:]}]"
+    for registry in (claude_home({}) / "sessions").glob("*.json"):
+        try:
+            record = json.loads(registry.read_text())
+            if not is_agent_process(record["pid"], "claude", record["startedAt"] / 1000):
+                continue
+            where.setdefault(record["sessionId"], f"Claude process {record['pid']}")
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    for record_file in PI_STATE.glob("*.json"):
+        try:
+            record = json.loads(record_file.read_text())
+            if not is_agent_process(record["pid"], "pi", record_file.stat().st_mtime):
+                continue
+            where.setdefault(record["sessionFile"], f"Pi process {record['pid']}")
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return where, by_block
+
+
+def retry_command(path):
+    if path == SNAPSHOT:
+        return "rex resurrect"
+    if path == RESTORED:
+        return "rex resurrect --again"
+    return f"rex resurrect --from {shlex.quote(str(path))}"
+
+
+def typed_line(p):
+    return f"cd {shlex.quote(p['cwd'])} && {p['command']}" if p.get("cwd") else p["command"]
+
+
+def restore(path, dry_run):
+    data = json.loads(path.read_text())
+    panes = data["panes"]
+    sessions, blocks, windows = live_layout()
+    ctx = Context()
+    rebuild = Rebuilder(sessions, blocks, windows)
+    is_open, live_found = open_conversations(sessions, blocks, ctx)
+    if not dry_run:
+        data["restored_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        write_json(path, data)  # from now on this save no longer blocks new saves
+
+    print(f"{'Checking' if dry_run else 'Restoring'} {len(panes)} agent panes saved {local(data['saved_at'])}.",
+          flush=True)
+    results, typed = {}, []
+    for i, p in enumerate(panes):
+        conv = p["conversation"]
+        if conv and conv["id"] in is_open:
+            results[i] = ("back", f"already open in {is_open[conv['id']]}")
+            continue
+        if p.get("cwd") and not os.path.isdir(p["cwd"]):
+            results[i] = ("failed", f"its folder {p['cwd']} no longer exists")
+            continue
+        try:
+            live = blocks.get(p["block_id"])
+            if live and live["creator"] == TERMINAL:
+                sid, bid = live["session_id"], p["block_id"]
+                found = live_found.get(bid) or {}
+                if is_back(p, found):  # an agent saved with no messages yet, running again
+                    results[i] = ("back", "already running")
+                    continue
+                if found.get("kind") == "agent":
+                    results[i] = ("busy", f"pane is running {found['agent']['agent']} "
+                                          "with a different conversation")
+                    continue
+                state = ("shell" if found.get("kind") == "shell" else found.get("program") or "a program") \
+                    if dry_run else wait_for_prompt(sid, bid)
+                if state != "shell":
+                    results[i] = ("busy", f"pane is running {state}")
+                    continue
+                action = "resume"
+            else:
+                action = "rebuild"
+            if dry_run:
+                results[i] = ("plan", "would resume in its pane" if action == "resume"
+                              else f"pane is gone, would rebuild it {rebuild.plan(p)}")
+                continue
+            if action == "rebuild":
+                how = rebuild.plan(p)
+                sid, bid, new_wid = rebuild.create(p)
+                p.update(session_id=sid, block_id=bid, window_id=new_wid or p.get("window_id"))
+                write_json(path, data)  # so an interrupted run never rebuilds this pane twice
+                if wait_for_prompt(sid, bid) != "shell":
+                    raise RexError("the new pane's shell didn't start")
+                note = f"pane was gone, rebuilt it {how}"
+            else:
+                note = "resumed in its pane"
+            rex("send", "-s", sid, "-b", bid, typed_line(p))
+            rex("send-key", "-s", sid, "-b", bid, "enter")
+            typed.append((i, sid, bid, note))
+            if conv:
+                is_open[conv["id"]] = f"{p['session_label']} [{bid[-8:]}]"
+        except (RexError, OSError, ValueError, KeyError, IndexError, TypeError) as e:
+            results[i] = ("failed", str(e))
+
+    # Check that every agent came back with its conversation.
+    if typed:
+        print(f"Waiting for {len(typed)} agent(s) to start (up to 2 minutes)...", flush=True)
+    deadline = time.time() + 120
+    waiting = list(typed)
+    while waiting and time.time() < deadline:
+        time.sleep(1.5)
+        ctx = Context()
+        still = []
+        for i, sid, bid, note in waiting:
+            try:
+                found = inspect_pane(sid, bid, ctx)
+            except (RexError, OSError, ValueError, KeyError, IndexError, TypeError):
+                found = {}
+            if is_back(panes[i], found):
+                results[i] = ("back", note)
+            else:
+                still.append((i, sid, bid, note))
+        waiting = still
+    for i, sid, bid, note in waiting:
+        results[i] = ("failed", f"{note}, but the agent didn't come back with its conversation "
+                                "within 2 minutes; check the pane")
+
+    labels = {"back": "back   ", "plan": "plan   ", "busy": "busy   ", "failed": "FAILED "}
+    for i, p in enumerate(panes):
+        status, note = results.get(i, ("failed", "not handled"))
+        where = f"{p['session_label']} / {p['window_label']}"
+        print(f"  {labels[status]} {where:<44} {p['agent']:<6} {describe(p)}: {note}")
+
+    bad = [panes[i] for i, (status, _) in sorted(results.items()) if status in ("busy", "failed")]
+    if dry_run:
+        return 1 if bad else 0
+    write_json(path, data)
+    back = sum(1 for status, _ in results.values() if status == "back")
+    print(f"\n{back} of {len(panes)} back.", end=" ")
+    if not bad:
+        if path == SNAPSHOT:
+            os.replace(SNAPSHOT, RESTORED)
+        print("Everything is restored.")
+        return 0
+    print(f"{len(bad)} need attention. To do them by hand, run these in a shell:")
+    for p in bad:
+        print(f"  {p['session_label']} / {p['window_label']}:")
+        print(f"    {typed_line(p)}")
+    print(f"Or free up the pane and run `{retry_command(path)}`; it only retries panes that aren't back.")
+    return 1
+
+
+# ---------- main ----------
+
+def main(argv):
+    if argv[:1] in (["-h"], ["--help"], ["help"]):
+        print(__doc__)
+        return 0
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(STATE_DIR / "lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("Another rex resurrect is running. Wait for it to finish.")
+        return 1
+
+    if argv[:1] == ["save"]:
+        if set(argv[1:]) - {"--force"}:
+            print(f"Unknown arguments: {' '.join(argv[1:])}. See `rex resurrect --help`.")
+            return 2
+        return save(force="--force" in argv)
+    if argv == ["show"]:
+        return show()
+    if argv[:1] == ["restore"]:
+        argv = argv[1:]
+    if argv[:1] == ["--from"]:
+        if len(argv) < 2 or set(argv[2:]) - {"--dry-run"}:
+            print("Usage: rex resurrect --from FILE [--dry-run]")
+            return 2
+        return restore(Path(argv[1]).expanduser(), dry_run="--dry-run" in argv)
+    if set(argv) - {"--dry-run", "--again"}:
+        print(f"Unknown arguments: {' '.join(argv)}. See `rex resurrect --help`.")
+        return 2
+    path = SNAPSHOT if SNAPSHOT.exists() else RESTORED if "--again" in argv else None
+    if path is None or not path.exists():
+        if RESTORED.exists():
+            print("Your last save was already restored. Run `rex resurrect --again` to restore it again.")
+        else:
+            print("Nothing saved yet. Run `rex resurrect save` before quitting Rex.")
+        return 1
+    return restore(path, dry_run="--dry-run" in argv)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except RexError as e:
+        print(f"Couldn't reach Rex: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
